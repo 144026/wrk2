@@ -1,5 +1,6 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
 
+#include <assert.h>
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
@@ -19,6 +20,7 @@ static struct config {
     uint64_t delay_ms;
     bool     latency;
     bool     u_latency;
+    bool     trace_req;
     bool     dynamic;
     bool     record_all_responses;
     char    *host;
@@ -68,11 +70,78 @@ static void usage() {
            "    -R, --rate        <T>  work rate (throughput)     \n"
            "                           in requests/sec (total)    \n"
            "                           [Required Parameter]       \n"
+           "        --trace            Trace request timing       \n"
            "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
 }
+
+struct trace_record {
+    uint16_t tid;
+    uint16_t cid;
+    uint32_t us;
+};
+
+static inline void trace_sock_write(thread* t, int cid, uint64_t start)
+{
+    if (t->trace_idx < t->trace_max_idx) {
+        struct trace_record *rec = (void *)&t->trace_buf[t->trace_idx++];
+        rec->tid = t->id;
+        rec->cid = cid;
+        rec->us = start;
+    }
+}
+
+static inline void open_trace_sock(thread *t)
+{
+    static const uint64_t bufsize = 4096U * 4096U;
+    t->trace_idx = 0;
+    /* 16MB per thread */
+    t->trace_max_idx = bufsize / sizeof(*t->trace_buf);
+    t->trace_buf = zcalloc(bufsize);
+    assert(t->trace_buf);
+}
+
+static inline void sync_trace_sock(thread *t, uint32_t start_us)
+{
+    int i;
+
+    for (i = 0; i < t->trace_idx; i++) {
+        struct trace_record *rec = (void *)&t->trace_buf[i];
+
+        rec->us -= start_us;
+    }
+}
+
+static inline void dump_trace_sock(thread *t)
+{
+    char trace_path[128];
+    int fd, flags = O_RDWR|O_CREAT|O_EXCL;
+
+    snprintf(trace_path, sizeof trace_path, "wrk-thread%d.trace", t->id);
+again:
+    fd = open(trace_path, flags, 0666);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            flags = O_RDWR;
+            goto again;
+        }
+        fprintf(stderr, "%s: %s\n", trace_path, strerror(errno));
+        return;
+    }
+
+    struct trace_head {
+        int version;
+        uint32_t nr_rec;
+    } head = { 1, t->trace_idx };
+
+    write(fd, &head, sizeof head);
+    write(fd, t->trace_buf, t->trace_idx * sizeof(*t->trace_buf));
+
+    close(fd);
+}
+
 
 int main(int argc, char **argv) {
     char *url, **headers = zmalloc(argc * sizeof(char *));
@@ -100,9 +169,9 @@ int main(int argc, char **argv) {
         sock.write    = ssl_write;
         sock.readable = ssl_readable;
     }
-	
+
     cfg.host = host;
-	
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
 
@@ -119,13 +188,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
         exit(1);
     }
-    
+
     uint64_t connections = cfg.connections / cfg.threads;
     double throughput    = (double)cfg.rate / cfg.threads;
     uint64_t stop_at     = time_us() + (cfg.duration * 1000000);
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
+        t->id = i;
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
         t->throughput = throughput;
@@ -136,6 +206,10 @@ int main(int argc, char **argv) {
 
         if (i == 0) {
             cfg.pipeline = script_verify_request(t->L);
+            if (cfg.trace_req && cfg.pipeline != 1) {
+                fprintf(stderr, "request timing trace only supports 'pipeline == 1'\n");
+                exit(2);
+            }
             cfg.dynamic = !script_is_static(t->L);
             if (script_want_response(t->L)) {
                 parser_settings.on_header_field = header_field;
@@ -193,6 +267,31 @@ int main(int argc, char **argv) {
 
         hdr_add(latency_histogram, t->latency_histogram);
         hdr_add(u_latency_histogram, t->u_latency_histogram);
+    }
+
+    if (cfg.trace_req) {
+        uint32_t trace_start = 0, first = 1;
+        for (uint64_t i = 0; i < cfg.threads; i++) {
+            thread *t = &threads[i];
+            struct trace_record *rec = (void *)&t->trace_buf[0];
+
+            if (!t->trace_idx) continue;
+            if (first) {
+                first = 0;
+                trace_start = rec->us;
+                continue;
+            }
+            if (rec->us < trace_start) {
+                if (trace_start - rec->us < INT32_MAX)
+                    trace_start = rec->us;
+            }
+        }
+        assert(!first);
+        for (uint64_t i = 0; i < cfg.threads; i++) {
+            thread *t = &threads[i];
+            sync_trace_sock(t, trace_start);
+            dump_trace_sock(t);
+        }
     }
 
     long double runtime_s   = runtime_us / 1000000.0;
@@ -256,6 +355,10 @@ void *thread_main(void *arg) {
     hdr_init(1, MAX_LATENCY, 3, &thread->latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &thread->u_latency_histogram);
 
+    if (cfg.trace_req) {
+        open_trace_sock(thread);
+    }
+
     char *request = NULL;
     size_t length = 0;
 
@@ -269,6 +372,7 @@ void *thread_main(void *arg) {
 
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         c->thread     = thread;
+        c->id = i;
         c->ssl        = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
         c->request    = request;
         c->length     = length;
@@ -526,20 +630,20 @@ static int response_complete(http_parser *parser) {
         printf("This wil never ever ever happen...");
         printf("But when it does. The following information will help in debugging");
         printf("response_complete:\n");
-        printf("  expected_latency_timing = %lld\n", expected_latency_timing);
-        printf("  now = %lld\n", now);
-        printf("  expected_latency_start = %lld\n", expected_latency_start);
-        printf("  c->thread_start = %lld\n", c->thread_start);
-        printf("  c->complete = %lld\n", c->complete);
+        printf("  expected_latency_timing = %"PRIu64"\n", expected_latency_timing);
+        printf("  now = %"PRIu64"\n", now);
+        printf("  expected_latency_start = %"PRIu64"\n", expected_latency_start);
+        printf("  c->thread_start = %"PRIu64"\n", c->thread_start);
+        printf("  c->complete = %"PRIu64"\n", c->complete);
         printf("  throughput = %g\n", c->throughput);
-        printf("  latest_should_send_time = %lld\n", c->latest_should_send_time);
-        printf("  latest_expected_start = %lld\n", c->latest_expected_start);
-        printf("  latest_connect = %lld\n", c->latest_connect);
-        printf("  latest_write = %lld\n", c->latest_write);
+        printf("  latest_should_send_time = %"PRIu64"\n", c->latest_should_send_time);
+        printf("  latest_expected_start = %"PRIu64"\n", c->latest_expected_start);
+        printf("  latest_connect = %"PRIu64"\n", c->latest_connect);
+        printf("  latest_write = %"PRIu64"\n", c->latest_write);
 
         expected_latency_start = c->thread_start +
                 ((c->complete ) / c->throughput);
-        printf("  next expected_latency_start = %lld\n", expected_latency_start);
+        printf("  next expected_latency_start = %"PRIu64"\n", expected_latency_start);
     }
 
     c->latest_should_send_time = 0;
@@ -622,6 +726,9 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
 
     if (!c->written) {
         c->start = time_us();
+        if (cfg.trace_req) {
+            trace_sock_write(thread, c->id, c->start);
+        }
         if (!c->has_pending) {
             c->actual_latency_start = c->start;
             c->complete_at_last_batch_start = c->complete;
@@ -699,6 +806,7 @@ static struct option longopts[] = {
     { "header",         required_argument, NULL, 'H' },
     { "latency",        no_argument,       NULL, 'L' },
     { "u_latency",      no_argument,       NULL, 'U' },
+    { "trace",          no_argument,       NULL, 257 },
     { "batch_latency",  no_argument,       NULL, 'B' },
     { "timeout",        required_argument, NULL, 'T' },
     { "help",           no_argument,       NULL, 'h' },
@@ -708,7 +816,7 @@ static struct option longopts[] = {
 };
 
 static int parse_args(struct config *cfg, char **url, struct http_parser_url *parts, char **headers, int argc, char **argv) {
-    char c, **header = headers;
+    int c, **header = headers;
 
     memset(cfg, 0, sizeof(struct config));
     cfg->threads     = 2;
@@ -744,6 +852,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'U':
                 cfg->latency = true;
                 cfg->u_latency = true;
+                break;
+            case 257:
+                cfg->trace_req = true;
                 break;
             case 'T':
                 if (scan_time(optarg, &cfg->timeout)) return -1;
