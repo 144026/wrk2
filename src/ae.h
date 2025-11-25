@@ -95,6 +95,9 @@ typedef struct aeEventLoop {
     int stop;
     void *apidata; /* This is used for polling API specific data */
     aeBeforeSleepProc *beforesleep;
+#ifdef HAVE_TRACE
+    void *tracedata;
+#endif
 } aeEventLoop;
 
 /* Prototypes */

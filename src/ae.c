@@ -40,9 +40,12 @@
 #include <time.h>
 #include <errno.h>
 
+#include "config.h"
 #include "ae.h"
 #include "zmalloc.h"
-#include "config.h"
+#ifdef HAVE_TRACE
+#include "trace.h"
+#endif
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
@@ -75,6 +78,9 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
+#ifdef HAVE_TRACE
+    eventLoop->tracedata = NULL;
+#endif
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -154,6 +160,12 @@ static void aeGetTime(long *seconds, long *milliseconds)
     gettimeofday(&tv, NULL);
     *seconds = tv.tv_sec;
     *milliseconds = tv.tv_usec/1000;
+}
+
+static uint64_t aeGetTimeUs(void) {
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return (t.tv_sec * 1000000) + t.tv_usec;
 }
 
 static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
@@ -367,7 +379,19 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             }
         }
 
+#ifdef HAVE_TRACE
+        if (eventLoop->tracedata) {
+            trace_epoll_wait(eventLoop->tracedata,
+                tvp ? (tvp->tv_sec*1000 + tvp->tv_usec/1000) : -1, aeGetTimeUs());
+        }
+#endif
         numevents = aeApiPoll(eventLoop, tvp);
+
+#ifdef HAVE_TRACE
+        if (eventLoop->tracedata) {
+            trace_epoll_wake(eventLoop->tracedata, numevents, aeGetTimeUs());
+        }
+#endif
         for (j = 0; j < numevents; j++) {
             aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
             int mask = eventLoop->fired[j].mask;

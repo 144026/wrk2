@@ -30,7 +30,6 @@ typedef struct {
     aeEventLoop *loop;
     struct addrinfo *addr;
     uint64_t connections;
-    int id;
     int interval;
     uint64_t stop_at;
     uint64_t complete;
@@ -45,8 +44,11 @@ typedef struct {
     lua_State *L;
     errors errors;
     struct connection *cs;
+#ifdef HAVE_TRACE
+    int id;
     uint64_t *trace_buf;
     uint32_t trace_idx, trace_max_idx;
+#endif
 } thread;
 
 typedef struct {
@@ -61,7 +63,6 @@ typedef struct connection {
     enum {
         FIELD, VALUE
     } state;
-    int id;
     int fd;
     SSL *ssl;
     double throughput;
@@ -87,6 +88,9 @@ typedef struct connection {
     uint64_t latest_expected_start;
     uint64_t latest_connect;
     uint64_t latest_write;
+#ifdef HAVE_TRACE
+    int id;
+#endif
 } connection;
 
 #endif /* WRK_H */

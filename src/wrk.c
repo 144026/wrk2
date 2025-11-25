@@ -1,11 +1,13 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
 
-#include <assert.h>
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
 #include "hdr_histogram.h"
 #include "stats.h"
+#ifdef HAVE_TRACE
+#include "trace.h"
+#endif
 
 // Max recordable latency of 1 day
 #define MAX_LATENCY 24L * 60 * 60 * 1000000
@@ -20,7 +22,9 @@ static struct config {
     uint64_t delay_ms;
     bool     latency;
     bool     u_latency;
-    bool     trace_req;
+#ifdef HAVE_TRACE
+    bool     trace;
+#endif
     bool     dynamic;
     bool     record_all_responses;
     char    *host;
@@ -70,78 +74,14 @@ static void usage() {
            "    -R, --rate        <T>  work rate (throughput)     \n"
            "                           in requests/sec (total)    \n"
            "                           [Required Parameter]       \n"
+#ifdef HAVE_TRACE
            "        --trace            Trace request timing       \n"
+#endif
            "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
 }
-
-struct trace_record {
-    uint16_t tid;
-    uint16_t cid;
-    uint32_t us;
-};
-
-static inline void trace_sock_write(thread* t, int cid, uint64_t start)
-{
-    if (t->trace_idx < t->trace_max_idx) {
-        struct trace_record *rec = (void *)&t->trace_buf[t->trace_idx++];
-        rec->tid = t->id;
-        rec->cid = cid;
-        rec->us = start;
-    }
-}
-
-static inline void open_trace_sock(thread *t)
-{
-    static const uint64_t bufsize = 4096U * 4096U;
-    t->trace_idx = 0;
-    /* 16MB per thread */
-    t->trace_max_idx = bufsize / sizeof(*t->trace_buf);
-    t->trace_buf = zcalloc(bufsize);
-    assert(t->trace_buf);
-}
-
-static inline void sync_trace_sock(thread *t, uint32_t start_us)
-{
-    int i;
-
-    for (i = 0; i < t->trace_idx; i++) {
-        struct trace_record *rec = (void *)&t->trace_buf[i];
-
-        rec->us -= start_us;
-    }
-}
-
-static inline void dump_trace_sock(thread *t)
-{
-    char trace_path[128];
-    int fd, flags = O_RDWR|O_CREAT|O_EXCL;
-
-    snprintf(trace_path, sizeof trace_path, "wrk-thread%d.trace", t->id);
-again:
-    fd = open(trace_path, flags, 0666);
-    if (fd < 0) {
-        if (errno == EEXIST) {
-            flags = O_RDWR;
-            goto again;
-        }
-        fprintf(stderr, "%s: %s\n", trace_path, strerror(errno));
-        return;
-    }
-
-    struct trace_head {
-        int version;
-        uint32_t nr_rec;
-    } head = { 1, t->trace_idx };
-
-    write(fd, &head, sizeof head);
-    write(fd, t->trace_buf, t->trace_idx * sizeof(*t->trace_buf));
-
-    close(fd);
-}
-
 
 int main(int argc, char **argv) {
     char *url, **headers = zmalloc(argc * sizeof(char *));
@@ -195,7 +135,9 @@ int main(int argc, char **argv) {
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
-        t->id = i;
+#ifdef HAVE_TRACE
+        t->id          = i;
+#endif
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
         t->throughput = throughput;
@@ -206,10 +148,12 @@ int main(int argc, char **argv) {
 
         if (i == 0) {
             cfg.pipeline = script_verify_request(t->L);
-            if (cfg.trace_req && cfg.pipeline != 1) {
+#ifdef HAVE_TRACE
+            if (cfg.trace && cfg.pipeline != 1) {
                 fprintf(stderr, "request timing trace only supports 'pipeline == 1'\n");
                 exit(2);
             }
+#endif
             cfg.dynamic = !script_is_static(t->L);
             if (script_want_response(t->L)) {
                 parser_settings.on_header_field = header_field;
@@ -269,7 +213,8 @@ int main(int argc, char **argv) {
         hdr_add(u_latency_histogram, t->u_latency_histogram);
     }
 
-    if (cfg.trace_req) {
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
         uint32_t trace_start = 0, first = 1;
         for (uint64_t i = 0; i < cfg.threads; i++) {
             thread *t = &threads[i];
@@ -293,6 +238,7 @@ int main(int argc, char **argv) {
             dump_trace_sock(t);
         }
     }
+#endif
 
     long double runtime_s   = runtime_us / 1000000.0;
     long double req_per_s   = complete   / runtime_s;
@@ -355,9 +301,12 @@ void *thread_main(void *arg) {
     hdr_init(1, MAX_LATENCY, 3, &thread->latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &thread->u_latency_histogram);
 
-    if (cfg.trace_req) {
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
         open_trace_sock(thread);
+        loop->tracedata = thread;
     }
+#endif
 
     char *request = NULL;
     size_t length = 0;
@@ -372,7 +321,9 @@ void *thread_main(void *arg) {
 
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         c->thread     = thread;
-        c->id = i;
+#ifdef HAVE_TRACE
+        c->id         = i;
+#endif
         c->ssl        = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
         c->request    = request;
         c->length     = length;
@@ -391,6 +342,11 @@ void *thread_main(void *arg) {
     aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
 
     thread->start = time_us();
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
+        trace_loop_start(thread, thread->start);
+    }
+#endif
     aeMain(loop);
 
     aeDeleteEventLoop(loop);
@@ -441,6 +397,11 @@ static int reconnect_socket(thread *thread, connection *c) {
 static int delayed_initial_connect(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
     c->thread_start = time_us();
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
+        trace_sock_conn_start(c->thread, c->id, c->thread_start);
+    }
+#endif
     connect_socket(c->thread, c);
     return AE_NOMORE;
 }
@@ -579,6 +540,11 @@ static int delay_request(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
     uint64_t time_usec_to_wait = usec_to_next_send(c);
     if (time_usec_to_wait) {
+#ifdef HAVE_TRACE
+        if (cfg.trace) {
+            trace_sock_delay_req_te(c->thread, c->id, time_us());
+        }
+#endif
         return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */
     }
     aeCreateFileEvent(c->thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
@@ -608,6 +574,12 @@ static int response_complete(http_parser *parser) {
         aeStop(thread->loop);
         goto done;
     }
+
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
+        trace_sock_resp(thread, c->id, now);
+    }
+#endif
 
     // Count all responses (including pipelined ones:)
     c->complete++;
@@ -683,6 +655,11 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
         case RETRY: return;
     }
 
+#ifdef HAVE_TRACE
+    if (cfg.trace) {
+        trace_sock_connected(c->thread, c->id, time_us());
+    }
+#endif
     http_parser_init(&c->parser, HTTP_RESPONSE);
     c->written = 0;
 
@@ -701,10 +678,16 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
 static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
     thread *thread = c->thread;
+    uint64_t now = time_us();
 
     if (!c->written) {
         uint64_t time_usec_to_wait = usec_to_next_send(c);
         if (time_usec_to_wait) {
+#ifdef HAVE_TRACE
+            if (cfg.trace) {
+                trace_sock_delay_req_fe(c->thread, c->id, now);
+            }
+#endif
             int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
 
             // Not yet time to send. Delay:
@@ -713,7 +696,7 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
                     thread->loop, msec_to_wait, delay_request, c, NULL);
             return;
         }
-        c->latest_write = time_us();
+        c->latest_write = now;
     }
 
     if (!c->written && cfg.dynamic) {
@@ -725,10 +708,12 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     size_t n;
 
     if (!c->written) {
-        c->start = time_us();
-        if (cfg.trace_req) {
+        c->start = now;
+#ifdef HAVE_TRACE
+        if (cfg.trace) {
             trace_sock_write(thread, c->id, c->start);
         }
+#endif
         if (!c->has_pending) {
             c->actual_latency_start = c->start;
             c->complete_at_last_batch_start = c->complete;
@@ -806,7 +791,9 @@ static struct option longopts[] = {
     { "header",         required_argument, NULL, 'H' },
     { "latency",        no_argument,       NULL, 'L' },
     { "u_latency",      no_argument,       NULL, 'U' },
+#ifdef HAVE_TRACE
     { "trace",          no_argument,       NULL, 257 },
+#endif
     { "batch_latency",  no_argument,       NULL, 'B' },
     { "timeout",        required_argument, NULL, 'T' },
     { "help",           no_argument,       NULL, 'h' },
@@ -853,9 +840,11 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 cfg->latency = true;
                 cfg->u_latency = true;
                 break;
+#ifdef HAVE_TRACE
             case 257:
-                cfg->trace_req = true;
+                cfg->trace = true;
                 break;
+#endif
             case 'T':
                 if (scan_time(optarg, &cfg->timeout)) return -1;
                 cfg->timeout *= 1000;
