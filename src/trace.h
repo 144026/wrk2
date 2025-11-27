@@ -16,6 +16,8 @@ enum trace_event {
     TRACE_EV_EPOLL_WAKE,
     TRACE_EV_DELAY_REQ_FE,
     TRACE_EV_DELAY_REQ_TE,
+    TRACE_EV_EXPECT_REQ_FE,
+    TRACE_EV_EXPECT_REQ_TE, // Unused
 };
 
 struct trace_record {
@@ -119,6 +121,28 @@ static inline void trace_sock_delay_req_te(thread* t, int cid, uint64_t us)
         struct trace_record *rec = (void *)&t->trace_buf[t->trace_idx++];
         rec->tid = t->id;
         rec->event = TRACE_EV_DELAY_REQ_TE;
+        rec->cid = cid;
+        rec->us = us;
+    }
+}
+
+static inline void trace_sock_expect_req_fe(thread* t, int cid, uint64_t us)
+{
+    if (t->trace_idx < t->trace_max_idx) {
+        struct trace_record *rec = (void *)&t->trace_buf[t->trace_idx++];
+        rec->tid = t->id;
+        rec->event = TRACE_EV_EXPECT_REQ_FE;
+        rec->cid = cid;
+        rec->us = us;
+    }
+}
+
+static inline void trace_sock_expect_req_te(thread* t, int cid, uint64_t us)
+{ // Unused
+    if (t->trace_idx < t->trace_max_idx) {
+        struct trace_record *rec = (void *)&t->trace_buf[t->trace_idx++];
+        rec->tid = t->id;
+        rec->event = TRACE_EV_EXPECT_REQ_TE;
         rec->cid = cid;
         rec->us = us;
     }

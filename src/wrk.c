@@ -542,7 +542,11 @@ static int delay_request(aeEventLoop *loop, long long id, void *data) {
     if (time_usec_to_wait) {
 #ifdef HAVE_TRACE
         if (cfg.trace) {
-            trace_sock_delay_req_te(c->thread, c->id, time_us());
+            uint64_t now = time_us();
+            trace_sock_delay_req_te(c->thread, c->id, now);
+            // XXX: Re-calculated usec_to_send is always the same as previous,
+            // it is the msec_to_send that differs. Do no trace usec_to_send again.
+            // trace_sock_expect_req_te(c->thread, c->id, now+time_usec_to_wait);
         }
 #endif
         return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */
@@ -683,13 +687,14 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     if (!c->written) {
         uint64_t time_usec_to_wait = usec_to_next_send(c);
         if (time_usec_to_wait) {
+            int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
+
 #ifdef HAVE_TRACE
             if (cfg.trace) {
                 trace_sock_delay_req_fe(c->thread, c->id, now);
+                trace_sock_expect_req_fe(c->thread, c->id, now+time_usec_to_wait);
             }
 #endif
-            int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
-
             // Not yet time to send. Delay:
             aeDeleteFileEvent(loop, fd, AE_WRITABLE);
             aeCreateTimeEvent(

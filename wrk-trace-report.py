@@ -36,6 +36,8 @@ class Record():
         Event("EPOLL_WAKE", 6),
         Event("DELAY_REQ_FE",  7),
         Event("DELAY_REQ_TE",  8),
+        Event("EXPECT_REQ_FE",  9),
+        Event("EXPECT_REQ_TE",  10), # Unused
     ]
     EVENT = {ev.name: ev.value for ev in EVENTS}
     def __init__(self, tid, event, cid, us):
@@ -203,15 +205,19 @@ def to_traceevent_v2(records):
             evs.append(event('Connect', 'conn', 'E', rec.us, pid=EVPID(tid), tid=EVTID(tid, 1+rec.cid)))
         elif rec.event == Record.EVENT["DELAY_REQ_FE"]: # triggered by RESP
             evs.append(event('Delay(FileEvent)', 'conn', 'i', rec.us, pid=EVPID(tid), tid=EVTID(tid, 1+rec.cid)))
+        elif rec.event == Record.EVENT["EXPECT_REQ_FE"]: # triggered by DELAY_REQ_FE
+            evs.append(event('Req-Expected', 'conn', 'i', rec.us, pid=EVPID(tid), tid=EVTID(tid, 1+rec.cid)))
         # loop events
         elif rec.event == Record.EVENT["DELAY_REQ_TE"]: # triggered by loop now_ms >= te->when_ms
             evs.append(event('Delay(TimeEvent)', 'loop', 'i', rec.us, pid=EVPID(tid), tid=EVTID(tid, 1+rec.cid)))
+        # elif rec.event == Record.EVENT["EXPECT_REQ_TE"]: # triggered by DELAY_REQ_TE
+        #     evs.append(event('Req-Expected(Updated)', 'loop', 'i', rec.us, pid=EVPID(tid), tid=EVTID(tid, 1+rec.cid)))
         elif rec.event == Record.EVENT["EPOLL_WAIT"]:
             ep_wait_to = rec.cid
-            evs.append(event('epoll_wait(%d)' % ep_wait_to, 'PERF', 'B', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
+            evs.append(event('epoll_wait(%d)' % ep_wait_to, 'loop', 'B', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
         elif rec.event == Record.EVENT["EPOLL_WAKE"]:
             # rec.cid: numevents
-            evs.append(event('epoll_wait(%d)' % ep_wait_to, 'PERF', 'E', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
+            evs.append(event('epoll_wait(%d)' % ep_wait_to, 'loop', 'E', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
             ep_wait_to = None
 
     return evs
