@@ -364,8 +364,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             } else {
                 tvp->tv_usec = (shortest->when_ms - now_ms)*1000;
             }
-            if (tvp->tv_sec < 0) tvp->tv_sec = 0;
-            if (tvp->tv_usec < 0) tvp->tv_usec = 0;
+            if (tvp->tv_sec < 0) {
+                /* Next timer should have fired, set timeout to zero */
+                tvp->tv_sec = tvp->tv_usec = 0;
+            }
+            if (tvp->tv_usec < 0) assert(0 && "tvp->tv_usec must not be negative");
         } else {
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to se the timeout
