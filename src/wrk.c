@@ -234,7 +234,8 @@ int main(int argc, char **argv) {
         assert(!first);
         for (uint64_t i = 0; i < cfg.threads; i++) {
             thread *t = &threads[i];
-            sync_trace_sock(t, trace_start);
+            // align trace record with wrk2 ms boundary
+            sync_trace_sock(t, trace_start - (trace_start%1000));
             dump_trace_sock(t);
         }
     }

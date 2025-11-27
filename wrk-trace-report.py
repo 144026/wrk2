@@ -189,7 +189,17 @@ def to_traceevent_v2(records):
     rec0 = records[0]
     assert rec0.event == Record.EVENT["LOOP_START"], "first trace record not LOOP_START"
     tid = rec0.tid
-    evs = [event('aeMain', 'loop', 'B', rec0.us, pid=EVPID(tid), tid=EVTID(tid, 0))]
+
+    evs = []
+    if rec0.us > 0:
+        # HACK: Perfetto always aligns first event to 0 us, breaking natural ms boundary,
+        # fake an event to prevent that.
+        # Well, even with this, us in trace record is still ~100us away from ms boundary
+        # perceived by processTimeEvents(), whyyyyyyyyyyyyyyyyyyyyyyyyy
+        evs.append(event('N/A', 'loop', 'B', 0, pid=EVPID(tid), tid=EVTID(tid, 0)))
+        evs.append(event('N/A', 'loop', 'E', rec0.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
+
+    evs.append(event('aeMain', 'loop', 'B', rec0.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
 
     ep_wait_to = None
 
