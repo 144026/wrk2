@@ -168,8 +168,10 @@ def meta_event(prop, pid, **kwargs):
         ev['tid'] = tid
     return ev
 
-# assume #conn < 100000 per thread, fake up ids so main thread can display correctly
-EVPID = lambda tid: tid * 100000
+GROUP_IDX = 0
+GROUP_NAME = None
+# assume #conn < 10000 per thread, fake up ids so main thread can display correctly
+EVPID = lambda tid: (tid + 100*GROUP_IDX) * 10000
 EVTID = lambda tid, cid: EVPID(tid) + cid
 
 def to_traceevent_v1(records):
@@ -187,7 +189,7 @@ def to_traceevent_v1(records):
 
 def to_traceevent_v2(records):
     rec0 = records[0]
-    assert rec0.event == Record.EVENT["LOOP_START"], "first trace record not LOOP_START"
+    if LOAD_OFF == 0: assert rec0.event == Record.EVENT["LOOP_START"], "first trace record not LOOP_START"
     tid = rec0.tid
 
     evs = []
@@ -225,7 +227,7 @@ def to_traceevent_v2(records):
         elif rec.event == Record.EVENT["EPOLL_WAIT"]:
             ep_wait_to = rec.cid
             evs.append(event('epoll_wait(%d)' % ep_wait_to, 'loop', 'B', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
-        elif rec.event == Record.EVENT["EPOLL_WAKE"]:
+        elif rec.event == Record.EVENT["EPOLL_WAKE"] and ep_wait_to is not None:
             # rec.cid: numevents
             evs.append(event('epoll_wait(%d)' % ep_wait_to, 'loop', 'E', rec.us, pid=EVPID(tid), tid=EVTID(tid, 0)))
             ep_wait_to = None
@@ -237,8 +239,11 @@ def to_traceevent(fname):
 
     tid = records[0].tid
     cids = set([rec.cid for rec in records if rec.event == Record.EVENT["REQ"]])
+    wrk_tname = "[%s] " % GROUP_NAME if GROUP_NAME else ""
+    wrk_tname += 'thread-%d (%s)' % (tid, fname)
     events = [
-        meta_event('process_name', EVPID(tid), name='thread-%d (%s)' % (tid, fname)),
+        meta_event('process_name', EVPID(tid), name=wrk_tname),
+        meta_event('process_sort_index', EVPID(tid), sort_index=(tid + 100*GROUP_IDX)),
         meta_event('thread_name', EVPID(tid), tid=EVTID(tid, 0), name='Event-loop-%d' % tid)
     ]
     events.extend([
@@ -261,15 +266,27 @@ def report_traceevent(args):
 parser = argparse.ArgumentParser()
 parser.add_argument('-n', action="store", type=int)
 parser.add_argument('-o', action="store", type=int)
-parser.add_argument('-S', action="store", type=int)
 parser.add_argument('-O', choices=["csv", "ms_csv", "echart", "traceevent"], default="traceevent")
+
+# for trace event
+parser.add_argument('-g', action="store", type=int)
+parser.add_argument('-G', action="store")
+
+# for echarts
+parser.add_argument('-S', action="store", type=int)
 parser.add_argument('--by-cid', action="store_true")
 parser.add_argument('--cids', action="store")
+
 parser.add_argument('file', nargs='+')
 args = parser.parse_args()
 
 if args.n: MAX_LOAD = args.n
 if args.o: LOAD_OFF = args.o
+
+if args.g: GROUP_IDX = args.g
+if args.G: GROUP_NAME = args.G
+
+# for echarts
 if args.S: SYM_SIZE = args.S
 if args.cids: FILT_CIDS = expand_lists(args.cids)
 
